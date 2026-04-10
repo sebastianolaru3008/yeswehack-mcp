@@ -12,7 +12,7 @@ import sys
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from auth import browser_login, load_token
+from auth import TotpRequired, api_login, browser_login, load_token
 from client import NotAuthenticatedError, NotFoundError, YesWeHackClient
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
@@ -39,13 +39,35 @@ def _client() -> YesWeHackClient:
 
 
 @mcp.tool()
-async def authenticate() -> str:
+async def authenticate(
+    email: str = "",
+    password: str = "",
+    totp: str = "",
+) -> str:
     """
-    Open a browser window so you can log in to YesWeHack.
-    Captures the session token automatically after login and stores it locally.
-    Call this first before using any other tool. Also call it when other tools
-    report that authentication is required.
+    Authenticate with YesWeHack and store the session token locally.
+    Call this first before using any other tool, or when a tool reports
+    that authentication is required.
+
+    Preferred: provide email + password for a fast, browser-free login.
+    If your account has 2FA enabled, the first call will ask for a TOTP code;
+    call again with the same email/password and add the totp argument.
+
+    Fallback: call with no arguments to open a browser window instead.
+
+    Args:
+        email:    Your YesWeHack account email.
+        password: Your YesWeHack account password.
+        totp:     6-digit TOTP code (only needed when 2FA is enabled).
     """
+    if email and password:
+        try:
+            return await api_login(email, password, totp or None)
+        except TotpRequired as e:
+            return str(e)
+        except ValueError as e:
+            return str(e)
+
     return await browser_login()
 
 
