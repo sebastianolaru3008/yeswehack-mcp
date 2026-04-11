@@ -69,7 +69,16 @@ def _save_token(token: str, exp: float):
 
 
 def load_token() -> str | None:
-    """Return the stored bearer token if it exists and is not expired."""
+    """Return the stored bearer token if it exists and is not expired.
+
+    Resolution order:
+      1. YWH_TOKEN environment variable (used as-is, no expiry check).
+      2. Token file (~/.config/yeswehack-mcp/token.json).
+    """
+    env_token = os.environ.get("YWH_TOKEN", "").strip()
+    if env_token:
+        return env_token
+
     if not TOKEN_FILE.exists():
         return None
     try:
@@ -97,6 +106,22 @@ def _format_result(token: str) -> str:
     exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     logger.info("Token stored. Expires: %s", exp_dt)
     return f"Authenticated successfully. Token valid until {exp_dt}."
+
+
+# ---------------------------------------------------------------------------
+# Mode 0: Direct token
+# ---------------------------------------------------------------------------
+
+def direct_token_auth(token: str) -> str:
+    """Store a pre-obtained bearer token directly, skipping credential login."""
+    token = token.strip()
+    if not token:
+        raise ValueError("Token must not be empty.")
+    exp = _decode_exp(token)
+    _save_token(token, exp)
+    exp_dt = datetime.fromtimestamp(exp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    logger.info("Direct token stored. Expires: %s", exp_dt)
+    return f"Token stored directly. Valid until {exp_dt}."
 
 
 # ---------------------------------------------------------------------------
