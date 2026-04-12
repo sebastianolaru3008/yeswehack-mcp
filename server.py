@@ -158,7 +158,8 @@ async def list_programs(
 @mcp.tool()
 async def get_program(slug: str) -> str:
     """
-    Get full details for a specific program, including scope and reward ranges.
+    Get full details for a specific program, including scope, reward ranges,
+    guidelines, requirements, out-of-scope rules, and disabled vulnerability types.
 
     Args:
         slug: The program slug/identifier (e.g. 'acme-corp'). Use list_programs to find slugs.
@@ -180,28 +181,86 @@ async def get_program(slug: str) -> str:
     except NotAuthenticatedError:
         return AUTH_ERROR
 
+    # --- Scopes (in-scope) ---
     scopes = p.get("scopes", [])
     scope_lines = "\n".join(
         f"  [{s.get('scope_type', '?')}] {s.get('scope', '?')}"
+        + (f" — {s.get('asset_label', '')}" if s.get("asset_label") else "")
         for s in scopes
     ) or "  (none listed)"
 
-    reward = p.get("reward_policy", {}) or {}
-    rewards_info = (
-        f"min: {reward.get('min_reward', 'N/A')} / max: {reward.get('max_reward', 'N/A')}"
-        if reward
-        else "N/A"
-    )
+    # --- Out-of-scope ---
+    out_of_scope = p.get("out_of_scope", [])
+    oos_lines = "\n".join(
+        f"  [{s.get('scope_type', '?')}] {s.get('scope', '?')}"
+        for s in out_of_scope
+    ) or "  (none listed)"
 
-    return "\n".join([
+    # --- Reward policy ---
+    reward = p.get("reward_policy", {}) or {}
+    if reward:
+        reward_parts = []
+        if reward.get("min_reward") is not None or reward.get("max_reward") is not None:
+            reward_parts.append(
+                f"range: {reward.get('min_reward', 'N/A')} – {reward.get('max_reward', 'N/A')}"
+            )
+        # Per-severity reward ranges
+        for sev in ("critical", "high", "medium", "low", "informative"):
+            key = f"{sev}_reward"
+            if reward.get(key) is not None:
+                reward_parts.append(f"{sev}: {reward[key]}")
+        rewards_info = " | ".join(reward_parts) if reward_parts else "N/A"
+    else:
+        rewards_info = "N/A"
+
+    # --- Disabled vulnerability types ---
+    disabled_vuln_types = p.get("disabled_vulnerability_types", []) or []
+    disabled_str = ", ".join(
+        v.get("name", str(v)) if isinstance(v, dict) else str(v)
+        for v in disabled_vuln_types
+    ) or "none"
+
+    # --- Guidelines / policy text ---
+    guidelines = (p.get("guidelines") or "").strip()
+    policy = (p.get("policy") or "").strip()
+
+    # --- Languages ---
+    langs = p.get("languages", []) or []
+    lang_str = ", ".join(
+        la.get("name", str(la)) if isinstance(la, dict) else str(la)
+        for la in langs
+    ) or "N/A"
+
+    # --- PGP key ---
+    pgp_key = (p.get("pgp_key") or "").strip()
+
+    sections = [
         f"Title   : {p.get('title', slug)}",
         f"Slug    : {slug}",
         f"Status  : {p.get('status', 'N/A')}",
         f"Public  : {p.get('public', '?')}",
         f"Bounty  : {p.get('bounty', False)}",
         f"Rewards : {rewards_info}",
-        f"Scopes:\n{scope_lines}",
-    ])
+        f"Languages: {lang_str}",
+        f"Disabled vuln types: {disabled_str}",
+        "",
+        "=== In-Scope Targets ===",
+        scope_lines,
+        "",
+        "=== Out-of-Scope Targets ===",
+        oos_lines,
+    ]
+
+    if guidelines:
+        sections += ["", "=== Guidelines ===", guidelines]
+
+    if policy:
+        sections += ["", "=== Policy / Requirements ===", policy]
+
+    if pgp_key:
+        sections += ["", "=== PGP Key ===", pgp_key]
+
+    return "\n".join(sections)
 
 
 @mcp.tool()
