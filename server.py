@@ -13,7 +13,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 from auth import TotpRequired, api_login, browser_login, direct_token_auth, load_token
-from client import NotAuthenticatedError, NotFoundError, YesWeHackClient
+from client import ForbiddenError, NotAuthenticatedError, NotFoundError, YesWeHackClient
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -169,8 +169,11 @@ async def get_program(slug: str) -> str:
         async with client:
             try:
                 p = await client.get(f"/programs/{slug}")
-            except NotFoundError:
-                # Fallback: search in the full program list
+                if not isinstance(p, dict):
+                    raise NotFoundError("Unexpected response type — falling back to list")
+            except (NotFoundError, ForbiddenError):
+                # Private programs may return 403/404 on the detail endpoint.
+                # Fall back to the program listing where they are always present.
                 programs = await client.get_all_pages("/programs")
                 matches = [x for x in programs if x.get("slug") == slug]
                 if not matches:

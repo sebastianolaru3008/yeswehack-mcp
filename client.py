@@ -15,6 +15,10 @@ class NotFoundError(Exception):
     pass
 
 
+class ForbiddenError(Exception):
+    pass
+
+
 class YesWeHackClient:
     def __init__(self, token: str):
         self._http = httpx.AsyncClient(
@@ -27,6 +31,8 @@ class YesWeHackClient:
         resp = await self._http.get(path, params=params)
         if resp.status_code == 401:
             raise NotAuthenticatedError("Token expired or invalid.")
+        if resp.status_code == 403:
+            raise ForbiddenError(f"Access forbidden: {path}")
         if resp.status_code == 404:
             raise NotFoundError(f"Resource not found: {path}")
         resp.raise_for_status()
