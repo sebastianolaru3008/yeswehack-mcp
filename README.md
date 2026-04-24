@@ -4,10 +4,13 @@ A [Model Context Protocol (MCP)](https://modelcontextprotocol.io) server for the
 
 ## Features
 
-- **Browser-based authentication** — opens a real Chromium window so you log in through the YesWeHack UI (2FA supported). No passwords stored anywhere.
+- **Flexible authentication** — browser login, email/password API login, copied bearer tokens, and official Personal Access Tokens.
 - **Private programs** — returns invite-only programs you have been accepted into, not just public ones.
 - **Full program details** — scope, reward ranges, status.
 - **Report access** — list and read reports with severity, CVSS, description, and bounty.
+- **Report comments** — list report discussion/messages when your account has access.
+- **Email aliases** — list your YesWeHack email aliases.
+- **Program credentials** — list credential pools/assigned credentials and request credentials for programs that expose pools.
 - **Hacktivity feed** — browse publicly disclosed reports.
 - **Token caching** — the JWT is stored locally and reused until it expires.
 
@@ -80,18 +83,38 @@ Once registered, start every session by authenticating:
 
 > **You:** Call the authenticate tool
 
-A Chromium window opens. Log in to YesWeHack as normal (email + password + 2FA if enabled). The window closes automatically once your session is detected. The token is saved to `~/.config/yeswehack-mcp/token.json` and reused for all subsequent calls until it expires.
+With no arguments, a Chromium window opens. Log in to YesWeHack as normal (email + password + 2FA if enabled). The window closes automatically once your session is detected. The token is saved to `~/.config/yeswehack-mcp/token.json` and reused for all subsequent calls until it expires.
+
+You can also authenticate without a browser:
+
+```text
+authenticate(email="you@example.com", password="...", totp="123456")
+authenticate(access_token="eyJ...")        # browser/API bearer token
+authenticate(access_token="ywh_pat_...")   # Personal Access Token
+```
+
+Environment variables are supported too:
+
+```bash
+export YWH_TOKEN="eyJ..."       # browser/API bearer token
+export YWH_PAT="ywh_pat_..."    # Personal Access Token
+```
 
 ### Available tools
 
 | Tool | Description |
 |------|-------------|
-| `authenticate` | Open browser login, capture and store your session token |
+| `authenticate` | Browser login, API login, or store a copied bearer token/PAT |
 | `get_current_user` | Show your YesWeHack profile (username, rank, reputation) |
 | `list_programs` | List all programs you have access to, including private invite-only ones |
 | `get_program` | Full details for a program: scope, reward ranges, status |
 | `list_reports` | List reports for a program, with optional status filter |
 | `get_report` | Full details of a specific report (title, severity, CVSS, description, bounty) |
+| `list_report_comments` | List comments/messages for a report when your token has access |
+| `list_email_aliases` | List your YesWeHack email aliases |
+| `get_program_credentials` | List credential pools and assigned credentials for a program |
+| `request_program_credentials` | Request credentials from a program credential pool |
+| `yeswehack_api_get` | Read-only escape hatch for authenticated API endpoints not wrapped yet |
 | `get_hacktivity` | Browse the public hacktivity (disclosed reports) feed |
 
 ### Example prompts
@@ -100,6 +123,10 @@ A Chromium window opens. Log in to YesWeHack as normal (email + password + 2FA i
 List all my private programs on YesWeHack.
 
 Show me the scope for the program with slug "acme-corp".
+
+List my YesWeHack email aliases.
+
+Get credentials for program "acme-corp".
 
 List all accepted reports for program "acme-corp".
 
@@ -110,7 +137,7 @@ Show me the latest hacktivity, page 2.
 
 ## Token storage
 
-The JWT is saved to `~/.config/yeswehack-mcp/token.json`. It contains only the token and its expiry timestamp — no credentials are ever stored. The browser profile (cookies, localStorage) is kept at `~/.config/yeswehack-mcp/browser-profile` so you do not have to fill in your email every time you re-authenticate.
+The token is saved to `~/.config/yeswehack-mcp/token.json`. It contains only the token and its expiry timestamp — no account password is ever stored. Browser/API session JWTs use their embedded expiry. Opaque Personal Access Tokens are cached locally until the YesWeHack API rejects them. The browser profile (cookies, localStorage) is kept at `~/.config/yeswehack-mcp/browser-profile` so you do not have to fill in your email every time you re-authenticate.
 
 To log out, delete the token file:
 

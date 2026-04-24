@@ -13,7 +13,14 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 from auth import TotpRequired, api_login, browser_login, direct_token_auth, load_token
-from client import ForbiddenError, NotAuthenticatedError, NotFoundError, YesWeHackClient
+from client import (
+    BadRequestError,
+    ConflictError,
+    ForbiddenError,
+    NotAuthenticatedError,
+    NotFoundError,
+    YesWeHackClient,
+)
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,6 +38,137 @@ def _client() -> YesWeHackClient:
     if not token:
         raise ValueError(AUTH_ERROR)
     return YesWeHackClient(token)
+
+
+def _as_json(data: object) -> str:
+    return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def _parse_params(params_json: str) -> dict:
+    if not params_json.strip():
+        return {}
+    try:
+        data = json.loads(params_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"params_json must be a JSON object: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError("params_json must be a JSON object.")
+    return data
+
+
+def _items_from(data: object, keys: tuple[str, ...] = ()) -> list:
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    if isinstance(data.get("items"), list):
+        return data["items"]
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _compact(value: object) -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (str, int, float)):
+        return str(value)
+    return _as_json(value)
+
+
+def _first_present(data: dict, *keys: str) -> object:
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+async def _get_with_fallback(
+    client: YesWeHackClient,
+    paths: list[str],
+    *,
+    params: dict | None = None,
+) -> tuple[str, object]:
+    errors = []
+    for path in paths:
+        try:
+            return path, await client.get(path, params=params)
+        except (NotFoundError, ForbiddenError) as e:
+            errors.append(f"{path}: {e}")
+            continue
+    raise NotFoundError("No candidate endpoint worked. Tried:\n" + "\n".join(errors))
+
+
+async def _post_with_fallback(
+    client: YesWeHackClient,
+    paths: list[str],
+    *,
+    payload: dict | None = None,
+) -> tuple[str, object]:
+    errors = []
+    for path in paths:
+        try:
+            return path, await client.post(path, json=payload or {})
+        except (NotFoundError, ForbiddenError, BadRequestError, ConflictError) as e:
+            errors.append(f"{path}: {e}")
+            continue
+    raise NotFoundError("No candidate endpoint worked. Tried:\n" + "\n".join(errors))
+
+
+def _format_alias(alias: dict) -> str:
+    address = _first_present(alias, "email", "alias", "address", "value") or "(unknown alias)"
+    enabled = _first_present(alias, "enabled", "active", "is_enabled")
+    program = _first_present(alias, "program", "program_title", "program_slug")
+    created = _first_present(alias, "created_at", "createdAt", "creation_date")
+    parts = [str(address)]
+    if enabled is not None:
+        parts.append(f"enabled: {_compact(enabled)}")
+    if program:
+        parts.append(f"program: {_compact(program)}")
+    if created:
+        parts.append(f"created: {created}")
+    return " | ".join(parts)
+
+
+def _format_credential_item(item: dict, include_secrets: bool) -> str:
+    title = _first_present(item, "title", "name", "label", "scope", "asset") or "credential"
+    status = _first_present(item, "status", "state", "assignment_status")
+    login = _first_present(item, "login", "username", "email", "identifier")
+    password = _first_present(item, "password", "secret")
+    pool_id = _first_present(item, "id", "uuid", "pool_id", "credential_pool_id")
+
+    parts = [str(title)]
+    if pool_id:
+        parts.append(f"id: {pool_id}")
+    if status:
+        parts.append(f"status: {status}")
+    if login:
+        parts.append(f"login: {login}")
+    if password:
+        parts.append(f"password: {password if include_secrets else '(hidden)'}")
+    return " | ".join(parts)
+
+
+def _collect_named_lists(data: object, wanted: tuple[str, ...]) -> list[dict]:
+    found: list[dict] = []
+
+    def walk(value: object):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in wanted and isinstance(child, list):
+                    found.extend(x for x in child if isinstance(x, dict))
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    walk(data)
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +479,285 @@ async def get_report(report_id: int) -> str:
         "Description:",
         r.get("description", "(empty)"),
     ])
+
+
+@mcp.tool()
+async def list_report_comments(report_id: int, raw: bool = False) -> str:
+    """
+    List comments/messages for a vulnerability report when your token has access.
+
+    Args:
+        report_id: The numeric report ID.
+        raw: Return raw JSON instead of a readable summary.
+    """
+    try:
+        client = _client()
+        async with client:
+            path, data = await _get_with_fallback(
+                client,
+                [
+                    f"/reports/{report_id}/comments",
+                    f"/reports/{report_id}/messages",
+                    f"/reports/{report_id}/activities",
+                ],
+            )
+    except ValueError as e:
+        return str(e)
+    except NotAuthenticatedError:
+        return AUTH_ERROR
+    except NotFoundError as e:
+        return f"Report comments for {report_id} were not found.\n{e}"
+    except ForbiddenError:
+        return f"Access forbidden for report {report_id} comments."
+
+    if raw:
+        return _as_json(data)
+
+    comments = _items_from(data, ("comments", "messages", "activities"))
+    if not comments:
+        return f"No comments/messages found for report {report_id}. Endpoint used: {path}"
+
+    lines = []
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        author = c.get("author") or c.get("user") or {}
+        if isinstance(author, dict):
+            author_name = author.get("username") or author.get("name") or "?"
+        else:
+            author_name = str(author)
+        created = _first_present(c, "created_at", "createdAt", "date") or "?"
+        body = _first_present(c, "message", "body", "content", "text") or ""
+        lines.append(f"[{created}] {author_name}: {body}")
+
+    return f"{len(lines)} comment/message(s) for report {report_id}:\n" + "\n\n".join(lines)
+
+
+@mcp.tool()
+async def list_email_aliases(raw: bool = False) -> str:
+    """
+    List your YesWeHack email aliases.
+
+    YesWeHack requires KYC verification for alias usage. The exact UI endpoint is
+    not publicly documented, so this tool tries the known API shapes and reports
+    the attempted endpoints if none work.
+
+    Args:
+        raw: Return raw JSON instead of a readable summary.
+    """
+    try:
+        client = _client()
+        async with client:
+            path, data = await _get_with_fallback(
+                client,
+                [
+                    "/user/email-aliases",
+                    "/users/me/email-aliases",
+                    "/me/email-aliases",
+                    "/email-aliases",
+                    "/email-alias",
+                ],
+            )
+    except ValueError as e:
+        return str(e)
+    except NotAuthenticatedError:
+        return AUTH_ERROR
+    except NotFoundError as e:
+        return str(e)
+
+    if raw:
+        return _as_json(data)
+
+    aliases = _items_from(data, ("aliases", "email_aliases", "emailAliases"))
+    if not aliases and isinstance(data, dict):
+        aliases = _collect_named_lists(data, ("aliases", "email_aliases", "emailAliases"))
+
+    if not aliases:
+        return f"No email aliases found. Endpoint used: {path}"
+
+    lines = [_format_alias(a) for a in aliases if isinstance(a, dict)]
+    return f"{len(lines)} email alias(es). Endpoint used: {path}\n" + "\n".join(lines)
+
+
+@mcp.tool()
+async def get_program_credentials(
+    program_slug: str,
+    include_secrets: bool = True,
+    raw: bool = False,
+) -> str:
+    """
+    Get credential pools and any assigned credentials for a specific program.
+
+    Some programs expose credential pools only after you are invited/accepted and
+    KYC-verified. If credentials require a request first, use
+    request_program_credentials with the pool id shown by this tool.
+
+    Args:
+        program_slug: Program slug/identifier.
+        include_secrets: Include passwords/secrets when the API returns them.
+        raw: Return raw JSON instead of a readable summary.
+    """
+    try:
+        client = _client()
+        async with client:
+            path, data = await _get_with_fallback(
+                client,
+                [
+                    f"/programs/{program_slug}/credentials",
+                    f"/programs/{program_slug}/credential-pools",
+                    f"/programs/{program_slug}/credentials-pools",
+                    f"/programs/{program_slug}/credentials/requests",
+                ],
+            )
+    except ValueError as e:
+        return str(e)
+    except NotAuthenticatedError:
+        return AUTH_ERROR
+    except NotFoundError as e:
+        return f"No credentials endpoint was available for '{program_slug}'.\n{e}"
+
+    if raw:
+        return _as_json(data)
+
+    credentials = _items_from(
+        data,
+        (
+            "credentials",
+            "credential_pools",
+            "credentialPools",
+            "pools",
+            "requests",
+        ),
+    )
+    if not credentials and isinstance(data, dict):
+        credentials = _collect_named_lists(
+            data,
+            (
+                "credentials",
+                "credential_pools",
+                "credentialPools",
+                "pools",
+                "requests",
+            ),
+        )
+
+    if not credentials:
+        return f"No credential pools or assigned credentials found for '{program_slug}'. Endpoint used: {path}"
+
+    lines = [
+        _format_credential_item(c, include_secrets=include_secrets)
+        for c in credentials
+        if isinstance(c, dict)
+    ]
+    return (
+        f"{len(lines)} credential item(s) for '{program_slug}'. Endpoint used: {path}\n"
+        + "\n".join(lines)
+    )
+
+
+@mcp.tool()
+async def request_program_credentials(
+    program_slug: str,
+    pool_id: str = "",
+    email: str = "",
+    raw: bool = False,
+) -> str:
+    """
+    Request credentials from a program credential pool.
+
+    This performs a state-changing YesWeHack action. Use get_program_credentials
+    first to find an available pool id. Some email-credential pools require an
+    email address; pass either a YesWeHack alias or another allowed address.
+
+    Args:
+        program_slug: Program slug/identifier.
+        pool_id: Optional credential pool id. If omitted, the generic program
+                 credential request endpoint is attempted.
+        email: Optional email address for email-based credential pools.
+        raw: Return raw JSON instead of a readable summary.
+    """
+    payload = {}
+    if email:
+        payload["email"] = email
+
+    if pool_id:
+        paths = [
+            f"/programs/{program_slug}/credentials/{pool_id}/request",
+            f"/programs/{program_slug}/credential-pools/{pool_id}/request",
+            f"/programs/{program_slug}/credentials-pools/{pool_id}/request",
+            f"/programs/{program_slug}/credentials/{pool_id}",
+        ]
+    else:
+        paths = [
+            f"/programs/{program_slug}/credentials/request",
+            f"/programs/{program_slug}/credentials",
+        ]
+
+    try:
+        client = _client()
+        async with client:
+            path, data = await _post_with_fallback(client, paths, payload=payload)
+    except ValueError as e:
+        return str(e)
+    except NotAuthenticatedError:
+        return AUTH_ERROR
+    except NotFoundError as e:
+        return f"Could not request credentials for '{program_slug}'.\n{e}"
+
+    if raw:
+        return _as_json(data)
+
+    if data is None:
+        return f"Credential request submitted for '{program_slug}'. Endpoint used: {path}"
+
+    items = _items_from(data, ("credentials", "requests", "items"))
+    if items:
+        lines = [
+            _format_credential_item(c, include_secrets=True)
+            for c in items
+            if isinstance(c, dict)
+        ]
+        return (
+            f"Credential request submitted for '{program_slug}'. Endpoint used: {path}\n"
+            + "\n".join(lines)
+        )
+
+    return (
+        f"Credential request submitted for '{program_slug}'. Endpoint used: {path}\n"
+        + _as_json(data)
+    )
+
+
+@mcp.tool()
+async def yeswehack_api_get(path: str, params_json: str = "") -> str:
+    """
+    Read an authenticated YesWeHack API endpoint that is not wrapped yet.
+
+    This is a read-only escape hatch for API coverage gaps. Path must be a
+    relative API path such as /programs/example or /reports/123.
+
+    Args:
+        path: Relative API path beginning with /.
+        params_json: Optional JSON object of query parameters.
+    """
+    if not path.startswith("/") or path.startswith("//") or "://" in path:
+        return "path must be a relative API path beginning with '/'."
+
+    try:
+        params = _parse_params(params_json)
+        client = _client()
+        async with client:
+            data = await client.get(path, params=params or None)
+    except ValueError as e:
+        return str(e)
+    except NotAuthenticatedError:
+        return AUTH_ERROR
+    except NotFoundError:
+        return f"Endpoint not found: {path}"
+    except ForbiddenError:
+        return f"Access forbidden: {path}"
+
+    return _as_json(data)
 
 
 @mcp.tool()

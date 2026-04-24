@@ -72,10 +72,10 @@ def load_token() -> str | None:
     """Return the stored bearer token if it exists and is not expired.
 
     Resolution order:
-      1. YWH_TOKEN environment variable (used as-is, no expiry check).
+      1. YWH_TOKEN or YWH_PAT environment variable (used as-is, no expiry check).
       2. Token file (~/.config/yeswehack-mcp/token.json).
     """
-    env_token = os.environ.get("YWH_TOKEN", "").strip()
+    env_token = os.environ.get("YWH_TOKEN", "").strip() or os.environ.get("YWH_PAT", "").strip()
     if env_token:
         return env_token
 
@@ -93,6 +93,10 @@ def load_token() -> str | None:
 
 def _decode_exp(token: str) -> float:
     """Decode JWT and return the exp claim as a Unix timestamp."""
+    if token.count(".") != 2 and not token.startswith("eyJ"):
+        # Personal Access Tokens are opaque and YesWeHack validates expiry
+        # server-side. Keep them locally until the API rejects them.
+        return time.time() + (10 * 365 * 24 * 60 * 60)
     try:
         payload = jwt.decode(token, options={"verify_signature": False})
         return float(payload.get("exp", 0))
