@@ -800,6 +800,317 @@ async def get_hacktivity(page: int = 1) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Report submission (write operations)
+# ---------------------------------------------------------------------------
+
+# YesWeHack submits reports via a two-step draft flow, NOT POST /reports:
+#   1. PUT  /programs/{slug}/reports/draft           -> save the draft
+#   2. POST /programs/{slug}/reports/draft/validate  -> submit (spends 1 credit)
+# The validate step requires the FULL body again, not an empty object.
+
+CVSS_METRICS = ("AV", "AC", "PR", "UI", "S", "C", "I", "A")
+IMPACT_MAX_LEN = 128
+
+
+def _parse_cvss_vector(vector: str) -> dict:
+    """Turn 'CVSS:3.1/AV:N/AC:H/...' into the component dict the API expects."""
+    vector = vector.strip()
+    if not vector:
+        raise ValueError("cvss_vector is required, e.g. CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:H/I:H/A:H")
+    parts = [p for p in vector.split("/") if p]
+    if parts and parts[0].upper().startswith("CVSS:"):
+        version = parts[0].split(":", 1)[1]
+        parts = parts[1:]
+    else:
+        version = "3.1"
+    if version != "3.1":
+        raise ValueError(f'Only CVSS 3.1 is supported by YesWeHack (got "{version}").')
+    out = {"version": version}
+    for part in parts:
+        if ":" not in part:
+            continue
+        k, v = part.split(":", 1)
+        k = k.upper()
+        if k in CVSS_METRICS:
+            out[k] = v.upper()
+    missing = [m for m in CVSS_METRICS if m not in out]
+    if missing:
+        raise ValueError(f"cvss_vector is missing metrics: {', '.join(missing)}")
+    return out
+
+
+def _build_report_body(
+    *, title, scope, description, bug_type, cvss_vector, end_point, vulnerable_part,
+    part_name, payload_sample, impact, source_ips, technical_environment,
+    application_finger_print, chainable,
+) -> dict:
+    impact = impact.strip()
+    if len(impact) > IMPACT_MAX_LEN:
+        raise ValueError(
+            f"impact must be {IMPACT_MAX_LEN} characters or less (got {len(impact)}). "
+            "It is a one-line summary; put the full analysis in `description`."
+        )
+    ips = [ip.strip() for ip in source_ips.split(",") if ip.strip()]
+    if not ips:
+        raise ValueError(
+            "source_ips is required by YesWeHack (at least one). "
+            "Pass the public IP you tested from, e.g. via `curl https://api.ipify.org`."
+        )
+    body = {
+        "title": title,
+        "scope": scope,
+        "description": description,
+        "impact": impact,
+        "bug_type": bug_type,
+        "cvss": _parse_cvss_vector(cvss_vector),
+        "end_point": end_point,
+        "vulnerable_part": vulnerable_part,
+        "part_name": part_name,
+        "payload_sample": payload_sample,
+        "source_ips": ips,
+        "chainable": chainable,
+    }
+    if technical_environment:
+        body["technical_environment"] = technical_environment
+    if application_finger_print:
+        body["application_finger_print"] = application_finger_print
+    return body
+
+
+def _format_validation_errors(err: Exception) -> str:
+    """YesWeHack returns nested Symfony form errors; flatten them usefully."""
+    text = str(err)
+    marker = text.find("{")
+    if marker == -1:
+        return text
+    try:
+        data = json.loads(text[marker:])
+    except (ValueError, json.JSONDecodeError):
+        return text
+    lines = []
+
+    def walk(node, prefix=""):
+        if isinstance(node, dict):
+            errs = node.get("errors")
+            if isinstance(errs, list):
+                for e in errs:
+                    lines.append(f"  {prefix or '(form)'}: {e}")
+            elif isinstance(errs, dict):
+                walk(errs, prefix)
+            children = node.get("children")
+            if isinstance(children, dict):
+                for k, v in children.items():
+                    walk(v, f"{prefix}.{k}" if prefix else k)
+        elif isinstance(node, list):
+            for e in node:
+                if isinstance(e, (dict, list)):
+                    walk(e, prefix)
+                else:
+                    lines.append(f"  {prefix or '(form)'}: {e}")
+
+    walk(data.get("errors", data))
+    return (data.get("message", "Validation Failed") + "\n" + "\n".join(lines)) if lines else text
+
+
+@mcp.tool()
+async def get_report_draft(program_slug: str) -> str:
+    """
+    Get the current (unsubmitted) report draft for a program.
+
+    Each program has one draft slot per hunter. Shows what is staged plus the
+    credit cost of submitting it.
+
+    Args:
+        program_slug: Program slug, e.g. 'acme-corp'.
+    """
+    try:
+        client = _client()
+        async with client:
+            d = await client.get(f"/programs/{program_slug}/reports/draft")
+    except ValueError as e:
+        return str(e)
+    except NotAuthenticatedError:
+        return AUTH_ERROR
+    except NotFoundError:
+        return f"No draft found for program '{program_slug}'."
+
+    d = d or {}
+    cvss = d.get("cvss") or {}
+    bug_type = d.get("bug_type") or {}
+    return "\n".join([
+        f"Draft ID        : {d.get('id', 'N/A')}",
+        f"Title           : {d.get('title') or '(empty)'}",
+        f"Scope           : {d.get('scope') or '(empty)'}",
+        f"Bug type        : {bug_type.get('name') if isinstance(bug_type, dict) else bug_type or '(empty)'}",
+        f"CVSS            : {cvss.get('vector') or '(empty)'}  score={cvss.get('score')}  criticity={cvss.get('criticity')}",
+        f"Endpoint        : {d.get('end_point') or '(empty)'}",
+        f"Vulnerable part : {d.get('vulnerable_part') or '(empty)'} / {d.get('part_name') or '(empty)'}",
+        f"Description     : {len(d.get('description') or '')} chars",
+        "",
+        f"Submission cost : {d.get('report_submission_cost')} credit(s)",
+        f"Credit balance  : {d.get('credit_balance')} -> {d.get('credit_balance_projected')} after submitting",
+    ])
+
+
+@mcp.tool()
+async def submit_report(
+    program_slug: str,
+    title: str,
+    scope: str,
+    description: str,
+    bug_type: str,
+    cvss_vector: str,
+    end_point: str,
+    vulnerable_part: str,
+    part_name: str,
+    payload_sample: str,
+    impact: str,
+    source_ips: str,
+    technical_environment: str = "",
+    application_finger_print: str = "",
+    chainable: bool = False,
+    dry_run: bool = True,
+) -> str:
+    """
+    Submit a vulnerability report to a YesWeHack program.
+
+    Uses the two-step draft flow: saves the draft, then validates it to submit.
+    SUBMITTING SPENDS A REPORT CREDIT AND CANNOT BE UNDONE, so this defaults to
+    dry_run=True: it saves and validates the draft, shows exactly what would be
+    submitted, and stops. Re-run with dry_run=False to actually submit.
+
+    Args:
+        program_slug: Program slug, e.g. 'acme-corp'.
+        title: Report title. Note the platform may recompose this from bug_type + impact.
+        scope: Must exactly match an in-scope asset string from get_program.
+        description: Full report body in Markdown.
+        bug_type: Bug type SLUG, e.g. 'improper-authentication-generic-cwe-287'.
+            Slugs follow '<name>-cwe-<number>'. Read one from an existing report via
+            get_report if unsure. The platform may override this on submission.
+        cvss_vector: Full CVSS 3.1 vector, e.g. 'CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:H/I:H/A:H'.
+        end_point: Affected path, e.g. '/api/v1/authorize'.
+        vulnerable_part: One of: get-parameter, post-parameter, path, header, cookie,
+            http-method, http-response, others.
+        part_name: Name of the vulnerable parameter/header, e.g. 'redirect_uri'.
+        payload_sample: Example payload.
+        impact: ONE-LINE impact summary, max 128 characters.
+        source_ips: Comma-separated public IP(s) you tested from. Required by the platform.
+        technical_environment: Tools/OS used.
+        application_finger_print: Stack fingerprint.
+        chainable: Whether this chains with another report.
+        dry_run: True (default) = stage and validate only. False = actually submit.
+    """
+    try:
+        body = _build_report_body(
+            title=title, scope=scope, description=description, bug_type=bug_type,
+            cvss_vector=cvss_vector, end_point=end_point, vulnerable_part=vulnerable_part,
+            part_name=part_name, payload_sample=payload_sample, impact=impact,
+            source_ips=source_ips, technical_environment=technical_environment,
+            application_finger_print=application_finger_print, chainable=chainable,
+        )
+    except ValueError as e:
+        return f"Invalid input: {e}"
+
+    draft_path = f"/programs/{program_slug}/reports/draft"
+    try:
+        client = _client()
+        async with client:
+            try:
+                draft = await client.put(draft_path, json=body) or {}
+            except BadRequestError as e:
+                return "Draft rejected by YesWeHack:\n" + _format_validation_errors(e)
+
+            cvss = draft.get("cvss") or {}
+            summary = [
+                f"Draft saved for '{program_slug}' (id {draft.get('id')})",
+                f"  Title    : {draft.get('title')}",
+                f"  Scope    : {draft.get('scope')}",
+                f"  CVSS     : {cvss.get('vector')} -> score {cvss.get('score')} ({cvss.get('criticity')})",
+                f"  Cost     : {draft.get('report_submission_cost')} credit(s); "
+                f"balance {draft.get('credit_balance')} -> {draft.get('credit_balance_projected')}",
+            ]
+
+            if dry_run:
+                summary.append("")
+                summary.append(
+                    "DRY RUN - nothing was submitted and no credit was spent. "
+                    "Re-run with dry_run=False to submit."
+                )
+                return "\n".join(summary)
+
+            try:
+                res = await client.post(f"{draft_path}/validate", json=body) or {}
+            except BadRequestError as e:
+                return ("Draft saved but submission was rejected:\n"
+                        + _format_validation_errors(e))
+    except ValueError as e:
+        return str(e)
+    except NotAuthenticatedError:
+        return AUTH_ERROR
+    except NotFoundError:
+        return f"Program '{program_slug}' not found, or it does not accept submissions."
+    except ForbiddenError as e:
+        return f"Access denied: {e}"
+
+    status = res.get("status") or {}
+    return "\n".join(summary[:1] + [
+        "",
+        "SUBMITTED",
+        f"  Report ID : {res.get('id')}",
+        f"  Local ID  : {res.get('local_id')}",
+        f"  Title     : {res.get('title')}",
+        f"  Criticity : {res.get('criticity')}",
+        f"  Status    : {status.get('workflow_state') if isinstance(status, dict) else status}",
+        f"  Bug type  : {(res.get('bug_type') or {}).get('name')}",
+        "",
+        "Note: the platform may override bug_type and recompose the title from it. "
+        "Check the values above; if the classification is wrong, use add_report_comment "
+        "to ask the triager to re-categorise (hunters cannot edit these directly).",
+    ])
+
+
+@mcp.tool()
+async def add_report_comment(report_id: int, message: str) -> str:
+    """
+    Post a public comment on one of your reports.
+
+    Use this to reply to a triager, add evidence, or request a corrected
+    classification. Hunters cannot edit a submitted report's title or bug type,
+    so a comment is the way to request those changes.
+
+    Args:
+        report_id: The numeric report ID.
+        message: Comment body (Markdown supported).
+    """
+    if not message.strip():
+        return "message cannot be empty."
+    try:
+        client = _client()
+        async with client:
+            # NOTE: only `message` and `attachments` are accepted for hunters.
+            # Sending `private` returns 400 "This form should not contain extra fields."
+            res = await client.post(
+                f"/reports/{report_id}/comments", json={"message": message}
+            ) or {}
+    except ValueError as e:
+        return str(e)
+    except NotAuthenticatedError:
+        return AUTH_ERROR
+    except NotFoundError:
+        return f"Report {report_id} not found."
+    except ForbiddenError:
+        return f"You do not have comment rights on report {report_id}."
+    except BadRequestError as e:
+        return "Comment rejected:\n" + _format_validation_errors(e)
+
+    return "\n".join([
+        f"Comment posted on report {report_id}",
+        f"  Comment ID : {res.get('id')}",
+        f"  Private    : {res.get('private')}",
+    ])
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

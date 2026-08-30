@@ -116,6 +116,9 @@ export YWH_PAT="ywh_pat_..."    # Personal Access Token
 | `request_program_credentials` | Request credentials from a program credential pool |
 | `yeswehack_api_get` | Read-only escape hatch for authenticated API endpoints not wrapped yet |
 | `get_hacktivity` | Browse the public hacktivity (disclosed reports) feed |
+| `get_report_draft` | Show the staged (unsubmitted) report draft for a program, plus its credit cost |
+| `submit_report` | **Submit a report.** Saves the draft then validates it. Defaults to `dry_run=True` |
+| `add_report_comment` | Post a public comment on one of your reports (reply to triage, request re-categorisation) |
 
 ### Example prompts
 
@@ -133,7 +136,44 @@ List all accepted reports for program "acme-corp".
 Get the full details of report 12345.
 
 Show me the latest hacktivity, page 2.
+
+Show the current report draft for "acme-corp".
+
+Submit a report to "acme-corp" (dry run first, then for real).
+
+Comment on report 12345 asking the triager to re-categorise it.
 ```
+
+### Submitting reports
+
+YesWeHack does **not** expose `POST /reports`. Submission is a two-step draft flow,
+which `submit_report` wraps:
+
+1. `PUT  /programs/{slug}/reports/draft` — stage the report
+2. `POST /programs/{slug}/reports/draft/validate` — submit it (**spends 1 credit**)
+
+The validate step needs the *full* body again, not an empty object.
+
+Because submission is irreversible and costs a credit, `submit_report` defaults to
+`dry_run=True`: it stages the draft, reports exactly what would be submitted and what
+the credit balance would become, then stops. Pass `dry_run=False` to actually submit.
+
+Field notes learned from the API:
+
+- `impact` is a **one-line summary, max 128 characters**. The full write-up goes in `description` (Markdown).
+- `source_ips` is **required** — at least one public IP you tested from.
+- `cvss_vector` takes a full CVSS 3.1 vector string and is split into components internally.
+  Only 3.1 is accepted by the platform.
+- `vulnerable_part` is an enum: `get-parameter`, `post-parameter`, `path`, `header`,
+  `cookie`, `http-method`, `http-response`, `others`.
+- `bug_type` is a **slug** shaped like `<name>-cwe-<number>`, e.g.
+  `improper-authentication-generic-cwe-287`. There is no public taxonomy endpoint —
+  read a slug off an existing report with `get_report` if unsure.
+- The platform may **override `bug_type`** and recompose the `title` from it on submission.
+  Hunters cannot edit a submitted report's title or bug type, so if the classification
+  comes back wrong, use `add_report_comment` to ask the triager to re-categorise.
+- Comments accept only `message` (and `attachments`). Sending `private` returns
+  `400 This form should not contain extra fields` for hunter-role tokens.
 
 ## Token storage
 
