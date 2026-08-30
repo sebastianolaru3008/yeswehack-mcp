@@ -2,6 +2,8 @@
 YesWeHack API client — async httpx wrapper with auth injection and pagination.
 """
 
+import json
+
 import httpx
 
 BASE_URL = "https://api.yeswehack.com"
@@ -82,6 +84,15 @@ class YesWeHackClient:
     ) -> dict | list | None:
         return await self.request("POST", path, params=params, json=json)
 
+    async def put(
+        self,
+        path: str,
+        *,
+        params: dict | None = None,
+        json: dict | None = None,
+    ) -> dict | list | None:
+        return await self.request("PUT", path, params=params, json=json)
+
     async def patch(
         self,
         path: str,
@@ -137,5 +148,10 @@ def _error_message(resp: httpx.Response, path: str) -> str:
     if isinstance(data, dict):
         message = data.get("message") or data.get("detail") or data.get("error")
         if message:
-            return f"HTTP {resp.status_code} for {path}: {message}"
+            base = f"HTTP {resp.status_code} for {path}: {message}"
+            # Preserve the nested form-error structure so callers can surface
+            # per-field validation messages instead of just "Validation Failed".
+            if data.get("errors"):
+                base += " " + json.dumps({"errors": data["errors"]})
+            return base
     return f"HTTP {resp.status_code} for {path}: {data}"
