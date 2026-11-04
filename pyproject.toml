@@ -3,7 +3,7 @@ name = "yeswehack-mcp"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.2.0",
+    "mcp[cli]>=1.2.0,<2",
     "httpx>=0.27.0",
     "playwright>=1.44.0",
     "pyjwt>=2.8.0",
@@ -14,4 +14,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-include = ["server.py", "auth.py", "client.py"]
+include = ["/server.py", "/auth.py", "/client.py"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["/.superpowers", "/.codex", "/.env", "/.env.*", "/dist", "/.venv"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-m 'not live'"
+markers = ["live: read-only tests against the real YesWeHack API (needs YWH_PAT)"]
+
+[dependency-groups]
+dev = ["pytest>=8,<9.2", "pytest-asyncio>=0.24"]

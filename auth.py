@@ -31,41 +31,23 @@ LOGIN_URL = "https://yeswehack.com/sign-in"
 POLL_INTERVAL = 1.0   # seconds
 POLL_TIMEOUT = 300.0  # 5 minutes
 
-# Well-known extension IDs to auto-detect from Windows Chrome/Edge/Brave in WSL2.
-_KNOWN_EXTENSION_IDS: dict[str, str] = {
-    "aeblfdkhhhdcdjpifhhbdiojplfjncoa": "1Password (Chrome)",
-    "dppgmdbiimibapkepcbdbmkaabgiofem": "1Password (Edge)",
-    "khgocmkkpikpnmmkgmdnfckapcdkgfaf": "1Password X",
-    "nkbihfbeogaeaoehlefnkodbefgpgknn": "MetaMask",
-    "fhgenkpocbhhddlgkjnpjkfeclcneobp": "Bitwarden",
-}
-
-# Windows Chrome/Edge/Brave extension directories accessible from WSL2
-_WIN_EXTENSION_DIRS: list[Path] = []
-for _user_dir in Path("/mnt/c/Users").glob("*"):
-    if not _user_dir.is_dir() or _user_dir.name in {"All Users", "Default", "Default User", "Public"}:
-        continue
-    for _browser_path in [
-        _user_dir / "AppData/Local/Google/Chrome/User Data/Default/Extensions",
-        _user_dir / "AppData/Local/Microsoft/Edge/User Data/Default/Extensions",
-        _user_dir / "AppData/Local/BraveSoftware/Brave-Browser/User Data/Default/Extensions",
-    ]:
-        if _browser_path.is_dir():
-            _WIN_EXTENSION_DIRS.append(_browser_path)
-
-
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 
 def _ensure_config_dir():
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _save_token(token: str, exp: float):
     _ensure_config_dir()
-    TOKEN_FILE.write_text(json.dumps({"token": token, "exp": exp}))
+    # Owner-only: the file holds a bearer token. fchmod also tightens a file
+    # that an older version created world-readable.
+    fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        os.fchmod(f.fileno(), 0o600)
+        f.write(json.dumps({"token": token, "exp": exp}))
 
 
 def load_token() -> str | None:
@@ -136,38 +118,55 @@ class TotpRequired(Exception):
     """Raised when the server requires a TOTP code to complete login."""
 
 
-async def api_login(email: str, password: str, totp: str | None = None) -> str:
+async def api_login(
+    email: str,
+    password: str,
+    totp: str | None = None,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> str:
     """
-    Authenticate via POST /login.  Handles the two-step TOTP flow:
-      - First call: email + password only.
-      - If the server returns {"totp": true}, raise TotpRequired.
-      - Second call: email + password + totp code.
+    Authenticate via the JWT session flow used by the official SDK:
+      1. POST /login {email, password}
+         -> {"token": <jwt>}            when 2FA is off
+         -> {"totp_token": <opaque>}    when 2FA is on
+      2. POST /account/totp {token: <totp_token>, code: <6 digits>}
+         -> {"token": <jwt>}
+    Raises TotpRequired when step 2 is needed but no code was given.
     """
-    payload: dict = {"email": email, "password": password}
-    if totp:
-        payload["otp"] = totp
+    async with httpx.AsyncClient(base_url=API_BASE, timeout=15.0, transport=transport) as http:
+        resp = await http.post("/login", json={"email": email, "password": password})
+        data = _json_or_empty(resp)
 
-    async with httpx.AsyncClient(base_url=API_BASE, timeout=15.0) as http:
-        resp = await http.post("/login", json=payload)
+        if resp.status_code == 401:
+            raise ValueError(f"Login failed: {data.get('message', 'Invalid credentials.')}")
+        if resp.status_code not in (200, 201):
+            raise ValueError(f"Login error {resp.status_code}: {data.get('message', resp.text)}")
 
-    data = resp.json()
+        token = data.get("token")
+        totp_token = data.get("totp_token")
 
-    if resp.status_code == 401:
-        msg = data.get("message", "Invalid credentials.")
-        raise ValueError(f"Login failed: {msg}")
+        if not token and totp_token:
+            if not totp:
+                raise TotpRequired("TOTP required. Call authenticate again with the totp argument.")
+            resp = await http.post("/account/totp", json={"token": totp_token, "code": totp})
+            data = _json_or_empty(resp)
+            if resp.status_code != 200:
+                raise ValueError(f"TOTP failed: {data.get('message', resp.text)}")
+            token = data.get("token")
 
-    if resp.status_code not in (200, 201):
-        raise ValueError(f"Login error {resp.status_code}: {data.get('message', resp.text)}")
-
-    # TOTP required — server may return 200 with a flag or 401 with a specific message
-    if data.get("otp") or data.get("totp"):
-        raise TotpRequired("TOTP required. Call authenticate again with the totp argument.")
-
-    token = data.get("token") or data.get("access_token")
     if not token:
         raise ValueError(f"No token in response. Keys: {list(data.keys())}")
 
     return _format_result(token)
+
+
+def _json_or_empty(resp: httpx.Response) -> dict:
+    try:
+        data = resp.json()
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +174,7 @@ async def api_login(email: str, password: str, totp: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 def _find_extensions() -> list[str]:
+    """Extensions listed explicitly in ~/.config/yeswehack-mcp/extensions.json (absolute dirs)."""
     paths: list[str] = []
 
     if EXTENSIONS_CONFIG.exists():
@@ -189,16 +189,6 @@ def _find_extensions() -> list[str]:
                         logger.warning("Configured extension path not found: %s", p)
         except Exception as e:
             logger.warning("Could not read extensions config: %s", e)
-
-    for ext_dir in _WIN_EXTENSION_DIRS:
-        for ext_id, name in _KNOWN_EXTENSION_IDS.items():
-            ext_base = ext_dir / ext_id
-            if not ext_base.is_dir():
-                continue
-            versions = sorted(ext_base.iterdir(), reverse=True)
-            if versions:
-                paths.append(str(versions[0]))
-                logger.info("Auto-detected extension '%s' at %s", name, versions[0])
 
     return paths
 

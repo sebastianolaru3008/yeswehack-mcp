@@ -28,7 +28,7 @@ class ConflictError(Exception):
 
 
 class YesWeHackClient:
-    def __init__(self, token: str):
+    def __init__(self, token: str, *, transport: httpx.AsyncBaseTransport | None = None):
         token = token.strip()
         if token.lower().startswith("bearer "):
             token = token[7:].strip()
@@ -44,6 +44,7 @@ class YesWeHackClient:
             base_url=BASE_URL,
             headers={**headers, "Accept": "application/json"},
             timeout=30.0,
+            transport=transport,
         )
 
     async def request(
